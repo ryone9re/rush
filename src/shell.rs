@@ -331,6 +331,9 @@ impl Worker {
                     eprintln!("rush: 無効なリダイレクト");
                     return false;
                 }
+                if let Some(fd) = output {
+                    syscall(|| unistd::close(fd)).unwrap();
+                }
                 output = Some(
                     fcntl::open(
                         (cmd[1].1)[1],
@@ -761,21 +764,8 @@ fn fork_exec(
                 syscall(|| dup2(infd, libc::STDIN_FILENO)).unwrap();
             }
             if let Some(outfd) = output {
-                syscall(|| {
-                    // TODO なぜかここで止まる
-                    let res = dup2(outfd, libc::STDOUT_FILENO);
-                    match res {
-                        Ok(i) => {
-                            println!("OK: {i}");
-                            Ok(())
-                        }
-                        Err(e) => {
-                            println!("E: {e}");
-                            Err(e)
-                        }
-                    }
-                })
-                .unwrap();
+                // TODO outputがdropされる
+                syscall(|| dup2(outfd, libc::STDOUT_FILENO)).unwrap();
             }
 
             // signal_hookで利用されるUnixドメインソケットとpipeをクローズ
