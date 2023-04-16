@@ -300,7 +300,7 @@ impl Worker {
 
     // 子プロセスを生成｡失敗した場合はシェルからの入力を再開させる必要あり｡
     fn spawn_child(&mut self, line: &str, cmd: &[(&str, Vec<&str>)]) -> bool {
-        assert_ne!(cmd.len(), 0); // コマンドがから出ないか検査
+        assert_ne!(cmd.len(), 0); // コマンドが空でないか検査
 
         // ジョブIDを登録
         let job_id = if let Some(id) = self.get_new_job_id() {
@@ -318,7 +318,7 @@ impl Worker {
         let mut input = None; // 2つ目のプロセスの標準入力
         let mut output = None; // 1つ目のプロセスの標準出力
         if cmd.len() == 2 {
-            if cmd[1].0 != ">" {
+            if cmd[1].0 != ">" && cmd[1].0 != "<" {
                 // パイプを作成
                 let p = pipe().unwrap();
                 input = Some(p.0);
@@ -326,22 +326,42 @@ impl Worker {
             }
 
             // リダイレクトならファイルを開いて､fdをセット
-            if cmd[1].0 == ">" {
-                if cmd[1].1.len() != 2 {
-                    eprintln!("rush: 無効なリダイレクト");
-                    return false;
+            match cmd[1].0 {
+                "<" => {
+                    if cmd[1].1.len() != 2 {
+                        eprintln!("rush: 無効なリダイレクト");
+                        return false;
+                    }
+                    if let Some(fd) = input {
+                        syscall(|| unistd::close(fd)).unwrap();
+                    }
+                    input = Some(
+                        fcntl::open(
+                            (cmd[1].1)[1],
+                            fcntl::OFlag::O_RDONLY,
+                            Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH,
+                        )
+                        .unwrap(),
+                    );
                 }
-                if let Some(fd) = output {
-                    syscall(|| unistd::close(fd)).unwrap();
+                ">" => {
+                    if cmd[1].1.len() != 2 {
+                        eprintln!("rush: 無効なリダイレクト");
+                        return false;
+                    }
+                    if let Some(fd) = output {
+                        syscall(|| unistd::close(fd)).unwrap();
+                    }
+                    output = Some(
+                        fcntl::open(
+                            (cmd[1].1)[1],
+                            fcntl::OFlag::O_WRONLY | fcntl::OFlag::O_CREAT,
+                            Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH,
+                        )
+                        .unwrap(),
+                    );
                 }
-                output = Some(
-                    fcntl::open(
-                        (cmd[1].1)[1],
-                        fcntl::OFlag::O_WRONLY | fcntl::OFlag::O_CREAT,
-                        Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH,
-                    )
-                    .unwrap(),
-                );
+                _ => {}
             }
         }
 
@@ -359,11 +379,16 @@ impl Worker {
 
         // 1つ目のプロセスを生成
         // 1つ目がリダイレクトは無効
-        if cmd.len() == 2 && cmd[0].0 == ">" {
+        if cmd.len() >= 2 && cmd[0].0 == ">" {
             eprintln!("rush: 無効なリダイレクト");
             return false;
         }
-        let pgid = match fork_exec(Pid::from_raw(0), cmd[0].0, &cmd[0].1, None, output) {
+        // <はスワップされるため来ないようになっている
+        if cmd.len() >= 2 && cmd[0].0 == "<" {
+            eprintln!("rush: 無効なリダイレクト");
+            return false;
+        }
+        let pgid = match fork_exec(Pid::from_raw(0), cmd[0].0, &cmd[0].1, input, output) {
             Ok(child) => child,
             Err(e) => {
                 eprintln!("rush: プロセス生成エラー: {e}");
@@ -380,7 +405,7 @@ impl Worker {
         pids.insert(pgid, info.clone()); // 1つ目のプロセスの情報
 
         // 2つ目のプロセスを生成
-        if cmd.len() == 2 && cmd[1].0 != ">" {
+        if cmd.len() == 2 && cmd[1].0 != ">" && cmd[1].0 != "<" {
             match fork_exec(pgid, cmd[1].0, &cmd[1].1, input, None) {
                 Ok(child) => {
                     pids.insert(child, info);
@@ -609,22 +634,42 @@ fn parse_cmd(line: &str) -> CmdResult {
         let mut cmd_iter = cmds.trim().split(' ');
         match cmd_iter.clone().count() {
             0 => return Err("コマンドがありません".into()),
-            1 => commands.push((cmd_iter.next().unwrap(), vec![])),
+            1 => {
+                let cmd = cmd_iter.next().unwrap();
+                if cmd != "<" && cmd != ">" {
+                    commands.push((cmd, vec![cmd]));
+                }
+            }
             _ => {
                 let mut cmd = cmd_iter.next().unwrap();
                 let mut vars = vec![cmd];
-                for v in cmd_iter.collect::<Vec<&str>>() {
-                    if v == ">" {
-                        commands.push((cmd, vars));
-                        cmd = v;
-                        vars = vec![];
-                    }
-                    if v != " " {
-                        vars.push(v);
+                if cmd == ">" || cmd == "<" {
+                    vars.push(cmd_iter.next().unwrap());
+                    commands.push((cmd, vars));
+                    cmd = cmd_iter.next().unwrap();
+                    vars = vec![cmd];
+                }
+                for v in cmd_iter {
+                    match v {
+                        ">" | "<" => {
+                            commands.push((cmd, vars));
+                            cmd = v;
+                            vars = vec![v];
+                        }
+                        " " => {}
+                        _ => vars.push(v),
                     }
                 }
                 commands.push((cmd, vars));
             }
+        }
+    }
+
+    // commandsの順番チェック
+    // 先頭が<なら後と入れ替える
+    if let Some(first) = commands.first() {
+        if first.0 == "<" && commands.len() >= 2 {
+            commands.swap(0, 1);
         }
     }
 
@@ -637,10 +682,13 @@ mod tests {
 
     #[test]
     fn test_parse_cmd_pipe() {
+        assert_eq!(parse_cmd("ls").unwrap(), vec![("ls", vec!["ls"])]);
+
         assert_eq!(
             parse_cmd("ls -l | grep .rs").unwrap(),
             vec![("ls", vec!["ls", "-l"]), ("grep", vec!["grep", ".rs"]),]
         );
+
         assert_eq!(
             parse_cmd("ls -l | grep .rs | wc -l").unwrap(),
             vec![
@@ -649,6 +697,7 @@ mod tests {
                 ("wc", vec!["wc", "-l"]),
             ]
         );
+
         assert_eq!(
             parse_cmd("ls -l | grep .rs | wc -l | grep 1").unwrap(),
             vec![
@@ -658,6 +707,7 @@ mod tests {
                 ("grep", vec!["grep", "1"]),
             ]
         );
+
         assert_eq!(
             parse_cmd("ls -l | grep .rs | wc -l | grep 1 | wc -l").unwrap(),
             vec![
@@ -670,6 +720,7 @@ mod tests {
         );
     }
 
+    // >のテスト
     #[test]
     fn test_parse_cmd_redir() {
         assert_eq!(
@@ -714,6 +765,44 @@ mod tests {
                 (">", vec![">", "out.txt"]),
             ]
         );
+    }
+
+    // <のテスト
+    #[test]
+    fn test_parse_cmd_redir_to_input() {
+        assert_eq!(
+            parse_cmd("cat < in.txt").unwrap(),
+            vec![("cat", vec!["cat"]), ("<", vec!["<", "in.txt"])]
+        );
+
+        assert_eq!(
+            parse_cmd("cat < in.txt | grep .rs").unwrap(),
+            vec![
+                ("cat", vec!["cat"]),
+                ("<", vec!["<", "in.txt"]),
+                ("grep", vec!["grep", ".rs"]),
+            ]
+        );
+
+        assert_eq!(
+            parse_cmd("cat < in.txt | grep .rs | wc -l").unwrap(),
+            vec![
+                ("cat", vec!["cat"]),
+                ("<", vec!["<", "in.txt"]),
+                ("grep", vec!["grep", ".rs"]),
+                ("wc", vec!["wc", "-l"]),
+            ]
+        );
+
+        assert_eq!(
+            parse_cmd("< in.txt cat | grep .rs | wc -l").unwrap(),
+            vec![
+                ("cat", vec!["cat"]),
+                ("<", vec!["<", "in.txt"]),
+                ("grep", vec!["grep", ".rs"]),
+                ("wc", vec!["wc", "-l"]),
+            ]
+        )
     }
 }
 
