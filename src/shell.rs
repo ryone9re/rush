@@ -337,7 +337,7 @@ impl Worker {
                 output = Some(
                     fcntl::open(
                         (cmd[1].1)[1],
-                        fcntl::OFlag::O_RDONLY | fcntl::OFlag::O_CREAT,
+                        fcntl::OFlag::O_WRONLY | fcntl::OFlag::O_CREAT,
                         Mode::S_IRUSR | Mode::S_IWUSR | Mode::S_IRGRP | Mode::S_IROTH,
                     )
                     .unwrap(),
@@ -764,7 +764,6 @@ fn fork_exec(
                 syscall(|| dup2(infd, libc::STDIN_FILENO)).unwrap();
             }
             if let Some(outfd) = output {
-                // TODO outputがdropされる
                 syscall(|| dup2(outfd, libc::STDOUT_FILENO)).unwrap();
             }
 
